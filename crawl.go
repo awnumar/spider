@@ -2,115 +2,117 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net/url"
-
-	"github.com/hashicorp/go-retryablehttp"
-	"golang.org/x/net/html"
+	"time"
 )
 
-type pageLinks struct {
-	pageAddr *url.URL
-	links    []*url.URL
-	errors   []*parsingError
-}
+func crawl(rootAddr *url.URL, delayBetweenRequests time.Duration) error {
+	fmt.Printf("Crawling %s with a minimum delay of %s between requests.\n\n", rootAddr, delayBetweenRequests.String())
+	client := newClient(delayBetweenRequests)
 
-type parsingError struct {
-	link string
-	err  error
-}
+	done := map[string]*pageLinks{}
 
-func crawl(rootURL string) error {
-	rootAddr, err := url.Parse(rootURL)
-	if err != nil {
-		return fmt.Errorf("error parsing address %s: %w", rootURL, err)
-	}
+	// results from crawling routines received here
+	results := make(chan *pageLinks)
 
-	seen := map[string]bool{}
+	// change in the number of active routines received here
+	delta := make(chan int)
 
-	queue := make(chan *url.URL, 256)
-	defer close(queue)
+	// queue of yet to crawl pages wait here
+	queue := make(chan *url.URL)
+
+	go func() {
+		numberOfRoutines := 0
+		for d := range delta {
+			numberOfRoutines += d
+			if numberOfRoutines == 0 {
+				close(queue)
+			}
+		}
+	}()
+
+	go func() {
+		for endpoint := range queue {
+			go func(addr *url.URL) {
+				delta <- 1
+				results <- parsePage(addr, client)
+
+			}(endpoint)
+		}
+		close(delta)
+		close(results)
+	}()
 
 	queue <- rootAddr
 
-	for address := range queue {
-		if !seen[address.String()] && address.Host == rootAddr.Host {
-			seen[address.String()] = true
+	for r := range results {
+		done[r.addr.String()] = r
 
-			if err := parsePage(address, queue); err != nil {
-				return err
+		for _, link := range r.links {
+			if done[link.String()] == nil {
+				done[link.String()] = &pageLinks{addr: link}
+				queue <- link
 			}
 		}
-		if len(queue) == 0 {
-			break
+
+		delta <- -1
+	}
+
+	for crawled := range done {
+		if len(done[crawled].links) != 0 {
+			fmt.Printf("\n\n:: Crawled page at URL %s, found these links:\n\n", crawled)
+			for _, result := range done[crawled].links {
+				fmt.Printf("+ %s\n", result.String())
+			}
+			if len(done[crawled].errors) != 0 {
+				fmt.Print("\n with these errors encountered:\n\n")
+				for _, err := range done[crawled].errors {
+					fmt.Printf("! link=%s, err=%s\n", err.addr, err.err)
+				}
+			}
+		} else {
+			if len(done[crawled].errors) != 0 {
+				fmt.Printf("\n\nErrors encountered while crawling %s:\n", done[crawled].addr.String())
+				for _, err := range done[crawled].errors {
+					fmt.Printf("! link=%s, err=%s\n", err.addr, err.err)
+				}
+			}
 		}
 	}
 
-	fmt.Print("\nDiscovered endpoints:\n\n")
-	for k := range seen {
-		fmt.Println(k)
+	fmt.Printf("\n\n:: Found these unique links on %s:\n\n", rootAddr)
+	for crawled := range done {
+		fmt.Println("+", crawled)
 	}
 
 	return nil
 }
 
-func startRoutine(address *url.URL) {
-
-}
-
-func parsePage(address *url.URL) (*pageLinks, error) {
-	resp, err := retryablehttp.Get(address.String())
-	if err != nil {
-		return nil, fmt.Errorf("error performing GET request to %s: %w", address, err)
+func parsePage(address *url.URL, c *client) *pageLinks {
+	result := &pageLinks{
+		addr:   address,
+		links:  []*url.URL{},
+		errors: []*pageError{},
 	}
+
+	maybeResponse := <-c.Get(address.String())
+	if maybeResponse.err != nil {
+		result.errors = append(result.errors, &pageError{
+			addr: address.String(),
+			err:  maybeResponse.err,
+		})
+		return result
+	}
+	resp := maybeResponse.resp
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("error: status %d from %s: %s", resp.StatusCode, address, resp.Status)
+		result.errors = append(result.errors, &pageError{
+			addr: address.String(),
+			err:  fmt.Errorf("error: status %d from %s: %s", resp.StatusCode, address, resp.Status),
+		})
+		return result
 	}
 
-	results := &pageLinks{
-		pageAddr: address,
-		links:    []*url.URL{},
-		errors:   []*parsingError{},
-	}
-
-	page := html.NewTokenizer(resp.Body)
-
-	for {
-		switch page.Next() {
-
-		case html.StartTagToken:
-			token := page.Token()
-			if token.Data == "a" {
-				for _, attribute := range token.Attr {
-					if attribute.Key == "href" {
-						parsedLink, err := url.Parse(attribute.Val)
-						if err != nil {
-							results.errors = append(results.errors, &parsingError{
-								link: attribute.Val,
-								err:  fmt.Errorf("skip: could not parse address %s: %w", attribute.Val, err),
-							})
-							break
-						}
-						if parsedLink.Host == "" { // convert relative links to absolute
-							parsedLink.Scheme = address.Scheme
-							parsedLink.User = address.User
-							parsedLink.Host = address.Host
-						}
-						if parsedLink.Host == address.Host {
-							results.links = append(results.links, parsedLink)
-						}
-						break
-					}
-				}
-			}
-
-		case html.ErrorToken:
-			if page.Err() != io.EOF {
-				return results, fmt.Errorf("error tokenizing html: %w", page.Err())
-			}
-			return results, nil
-		}
-	}
+	return extractLinks(resp.Body, result)
 }
