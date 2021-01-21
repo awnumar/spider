@@ -33,7 +33,8 @@ func newClient(delay time.Duration) *client {
 	go func() {
 		last := time.Now()
 		for cmd := range cl.reqs {
-			for time.Since(last) < cl.delay {
+			if time.Since(last) < cl.delay {
+				time.Sleep(cl.delay - time.Since(last))
 			}
 			last = time.Now()
 
